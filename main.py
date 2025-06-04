@@ -1,4 +1,4 @@
-# main.py - LMS Face Recognition API integrated with existing MySQL database
+# main.py - LMS Face Recognition API integrated with existing MySQL database and AWS S3
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -26,13 +26,17 @@ from cryptography.fernet import Fernet
 import pickle
 import pymysql
 from dotenv import load_dotenv
+
+# Import S3 service
+from s3_service import S3Service
+
 load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
     title="LMS Face Recognition API",
-    description="Face registration and verification system integrated with existing LMS MySQL database",
-    version="2.0.0"
+    description="Face registration and verification system integrated with existing LMS MySQL database and AWS S3",
+    version="2.1.0"
 )
 
 # Configure CORS for your Next.js frontend
@@ -49,7 +53,6 @@ app.add_middleware(
 )
 
 # Database configuration for MySQL
-db_url = "DATABASE_URL"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Create engine for MySQL
@@ -71,11 +74,19 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ENCRYPTION_KEY = os.getenv("FACE_ENCRYPTION_KEY", Fernet.generate_key())
 cipher_suite = Fernet(ENCRYPTION_KEY)
 
+# Initialize S3 service
+try:
+    s3_service = S3Service()
+    logger.info("✅ S3 service initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize S3 service: {str(e)}")
+    s3_service = None
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database Models - Matching your existing schema
+# Database Models - Updated with S3 fields
 class AppUser(Base):
     """Model matching your existing AppUser table"""
     __tablename__ = "AppUser"
@@ -100,7 +111,7 @@ class AppUser(Base):
     UpdationDateTime = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 class Face(Base):
-    """Enhanced Face model for DeepFace integration"""
+    """Enhanced Face model for DeepFace integration with S3 storage"""
     __tablename__ = "Face"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -116,19 +127,22 @@ class Face(Base):
     QualityScore = Column(Float, nullable=True)
     FaceConfidence = Column(Float, nullable=True)
     
-    # Image storage
-    ImagePath = Column(String(500), nullable=True)
-    ImageBase64 = Column(Text, nullable=True)  # For small images
+    # S3 storage fields
+    S3Key = Column(String(500), nullable=True)  # S3 object key
+    S3Url = Column(String(1000), nullable=True)  # S3 object URL
+    ImagePath = Column(String(500), nullable=True)  # Keep for backward compatibility
+    ImageBase64 = Column(Text, nullable=True)  # For small images (deprecated)
     
     # Status and metadata
     IsActive = Column(Boolean, default=True)
     RegistrationSource = Column(String(50), default="api")  # api, mobile, web
+    StorageType = Column(String(20), default="s3")  # s3, local, base64
     
     CreationDateTime = Column(TIMESTAMP, server_default=func.now())
     UpdationDateTime = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 class FaceVerification(Base):
-    """New table for verification audit trail"""
+    """Enhanced verification table with S3 storage"""
     __tablename__ = "FaceVerification"
     
     id = Column(Integer, primary_key=True, index=True)
@@ -147,9 +161,12 @@ class FaceVerification(Base):
     DistanceMetric = Column(String(20), nullable=False)
     ProcessingTime = Column(Float, nullable=True)  # in milliseconds
     
-    # Image data
-    VerificationImagePath = Column(String(500), nullable=True)
+    # S3 storage fields
+    S3Key = Column(String(500), nullable=True)  # S3 object key
+    S3Url = Column(String(1000), nullable=True)  # S3 object URL
+    VerificationImagePath = Column(String(500), nullable=True)  # Keep for backward compatibility
     QualityScore = Column(Float, nullable=True)
+    StorageType = Column(String(20), default="s3")  # s3, local
     
     # Metadata
     IPAddress = Column(String(45), nullable=True)
@@ -169,7 +186,7 @@ def get_db():
     finally:
         db.close()
 
-# DeepFace Recognition Service (same as before but optimized for MySQL)
+# DeepFace Recognition Service (same as before)
 class DeepFaceRecognitionService:
     def __init__(self):
         self.model_name = os.getenv("DEEPFACE_MODEL", "ArcFace")
@@ -390,19 +407,41 @@ def decrypt_face_encoding(encrypted_data: bytes) -> np.ndarray:
     decrypted_bytes = cipher_suite.decrypt(encrypted_data)
     return pickle.loads(decrypted_bytes)
 
-def save_uploaded_file(file: UploadFile, user_id: int, file_type: str) -> str:
-    """Save uploaded file and return path"""
+def save_image_to_storage(file: UploadFile, user_id: int, image_type: str) -> Dict[str, str]:
+    """
+    Save image to S3 or local storage (fallback)
+    Returns dict with storage info
+    """
+    if s3_service:
+        try:
+            s3_key, s3_url = s3_service.upload_face_image(file, user_id, image_type)
+            return {
+                "storage_type": "s3",
+                "s3_key": s3_key,
+                "s3_url": s3_url,
+                "path": s3_url  # For backward compatibility
+            }
+        except Exception as e:
+            logger.error(f"S3 upload failed, falling back to local storage: {str(e)}")
+    
+    # Fallback to local storage
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
     
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-    filename = f"{user_id}_{file_type}_{uuid.uuid4().hex}.{file_extension}"
+    filename = f"{user_id}_{image_type}_{uuid.uuid4().hex}.{file_extension}"
     file_path = os.path.join(upload_dir, filename)
     
+    file.file.seek(0)
     with open(file_path, "wb") as buffer:
         buffer.write(file.file.read())
     
-    return file_path
+    return {
+        "storage_type": "local",
+        "s3_key": None,
+        "s3_url": None,
+        "path": file_path
+    }
 
 def convert_numpy_types(obj):
     """Convert numpy types to Python native types"""
@@ -436,9 +475,10 @@ async def root():
     """Health check endpoint"""
     return {
         "service": "LMS Face Recognition API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "engine": "DeepFace",
         "database": "MySQL",
+        "storage": "AWS S3" if s3_service else "Local",
         "model": face_service.model_name,
         "detector": face_service.detector_backend,
         "status": "healthy",
@@ -493,9 +533,9 @@ async def register_face(
                 detail=f"Photo quality too low ({result['quality_score']:.1f}/100). Please upload a clearer photo."
             )
         
-        # Save photo file
+        # Save image to S3 or local storage
         file.file.seek(0)
-        photo_path = save_uploaded_file(file, user_id, "registration")
+        storage_info = save_image_to_storage(file, user_id, "registration")
         
         # Encrypt face embedding
         encrypted_embedding = encrypt_face_encoding(result["encoding"])
@@ -514,7 +554,10 @@ async def register_face(
             DetectorBackend=face_service.detector_backend,
             QualityScore=result["quality_score"],
             FaceConfidence=result["face_confidence"],
-            ImagePath=photo_path,
+            S3Key=storage_info["s3_key"],
+            S3Url=storage_info["s3_url"],
+            ImagePath=storage_info["path"],  # Backward compatibility
+            StorageType=storage_info["storage_type"],
             RegistrationSource=source
         )
         
@@ -522,7 +565,7 @@ async def register_face(
         db.commit()
         db.refresh(new_face)
         
-        logger.info(f"Face registered for user {user_id} using {result['model_name']} (quality: {result['quality_score']:.1f})")
+        logger.info(f"Face registered for user {user_id} using {result['model_name']} (quality: {result['quality_score']:.1f}) - Storage: {storage_info['storage_type']}")
         
         response = {
             "success": True,
@@ -533,6 +576,8 @@ async def register_face(
             "face_confidence": result["face_confidence"],
             "model_name": result["model_name"],
             "processing_time": result["processing_time"],
+            "storage_type": storage_info["storage_type"],
+            "s3_url": storage_info["s3_url"] if storage_info["storage_type"] == "s3" else None,
             "message": "Face registered successfully"
         }
         
@@ -586,9 +631,9 @@ async def verify_face(
         current_result = face_service.extract_face_encoding(image_array)
         
         if not current_result["success"]:
-            # Log failed verification
+            # Save failed verification image and log
             file.file.seek(0)
-            photo_path = save_uploaded_file(file, user_id, "verification_failed")
+            storage_info = save_image_to_storage(file, user_id, "verification_failed")
             
             verification = FaceVerification(
                 UserID=user_id,
@@ -601,7 +646,10 @@ async def verify_face(
                 ModelName=face_service.model_name,
                 DistanceMetric=face_service.distance_metric,
                 ProcessingTime=current_result.get("processing_time", 0),
-                VerificationImagePath=photo_path,
+                S3Key=storage_info["s3_key"],
+                S3Url=storage_info["s3_url"],
+                VerificationImagePath=storage_info["path"],
+                StorageType=storage_info["storage_type"],
                 QualityScore=0.0
             )
             db.add(verification)
@@ -618,9 +666,9 @@ async def verify_face(
             current_result["encoding"]
         )
         
-        # Save verification photo
+        # Save verification image
         file.file.seek(0)
-        photo_path = save_uploaded_file(file, user_id, "verification")
+        storage_info = save_image_to_storage(file, user_id, "verification")
         
         # Log verification attempt
         verification = FaceVerification(
@@ -634,7 +682,10 @@ async def verify_face(
             ModelName=comparison_result["model_name"],
             DistanceMetric=comparison_result["distance_metric"],
             ProcessingTime=comparison_result["processing_time"],
-            VerificationImagePath=photo_path,
+            S3Key=storage_info["s3_key"],
+            S3Url=storage_info["s3_url"],
+            VerificationImagePath=storage_info["path"],
+            StorageType=storage_info["storage_type"],
             QualityScore=current_result["quality_score"]
         )
         
@@ -661,6 +712,7 @@ async def verify_face(
             "quality_score": current_result["quality_score"],
             "processing_time": comparison_result["processing_time"],
             "model_name": comparison_result["model_name"],
+            "storage_type": storage_info["storage_type"],
             "message": "Identity verified successfully" if comparison_result["is_match"] else "Identity verification failed"
         }
         
@@ -696,6 +748,14 @@ async def get_face_status(
         ).first()
         
         if face:
+            # Generate presigned URL if S3 is used
+            presigned_url = None
+            if face.S3Key and s3_service:
+                try:
+                    presigned_url = s3_service.get_presigned_url(face.S3Key, expiration=3600)
+                except Exception as e:
+                    logger.warning(f"Failed to generate presigned URL: {str(e)}")
+            
             return {
                 "user_id": user_id,
                 "user_name": user.Name,
@@ -706,6 +766,9 @@ async def get_face_status(
                 "model_name": face.ModelName,
                 "detector_backend": face.DetectorBackend,
                 "registration_source": face.RegistrationSource,
+                "storage_type": face.StorageType,
+                "s3_url": face.S3Url,
+                "presigned_url": presigned_url,
                 "registered_at": face.CreationDateTime.isoformat() if face.CreationDateTime else None
             }
         else:
@@ -746,26 +809,38 @@ async def get_verification_history(
         user = db.query(AppUser).filter(AppUser.id == user_id).first()
         user_name = user.Name if user else "Unknown"
         
+        verification_list = []
+        for v in verifications:
+            # Generate presigned URL if S3 is used
+            presigned_url = None
+            if v.S3Key and s3_service:
+                try:
+                    presigned_url = s3_service.get_presigned_url(v.S3Key, expiration=3600)
+                except Exception as e:
+                    logger.warning(f"Failed to generate presigned URL: {str(e)}")
+            
+            verification_list.append({
+                "verification_id": v.id,
+                "quiz_id": v.QuizID,
+                "course_id": v.CourseID,
+                "verified": v.VerificationResult,
+                "similarity_score": v.SimilarityScore,
+                "distance": v.Distance,
+                "quality_score": v.QualityScore,
+                "processing_time": v.ProcessingTime,
+                "model_name": v.ModelName,
+                "distance_metric": v.DistanceMetric,
+                "storage_type": v.StorageType,
+                "s3_url": v.S3Url,
+                "presigned_url": presigned_url,
+                "verified_at": v.VerificationDateTime.isoformat() if v.VerificationDateTime else None
+            })
+        
         return {
             "user_id": user_id,
             "user_name": user_name,
             "total_verifications": len(verifications),
-            "verifications": [
-                {
-                    "verification_id": v.id,
-                    "quiz_id": v.QuizID,
-                    "course_id": v.CourseID,
-                    "verified": v.VerificationResult,
-                    "similarity_score": v.SimilarityScore,
-                    "distance": v.Distance,
-                    "quality_score": v.QualityScore,
-                    "processing_time": v.ProcessingTime,
-                    "model_name": v.ModelName,
-                    "distance_metric": v.DistanceMetric,
-                    "verified_at": v.VerificationDateTime.isoformat() if v.VerificationDateTime else None
-                }
-                for v in verifications
-            ]
+            "verifications": verification_list
         }
         
     except Exception as e:
@@ -782,14 +857,23 @@ async def health_check(db: Session = Depends(get_db)):
     except:
         db_status = "error"
     
+    # Test S3 connection
+    s3_status = "not_configured"
+    s3_info = {}
+    if s3_service:
+        s3_info = s3_service.check_bucket_health()
+        s3_status = s3_info.get("status", "error")
+    
     return {
-        "status": "healthy" if db_status == "operational" else "degraded",
+        "status": "healthy" if db_status == "operational" and s3_status in ["healthy", "not_configured"] else "degraded",
         "timestamp": datetime.utcnow().isoformat(),
         "engine": "DeepFace",
         "database": "MySQL",
+        "storage": "AWS S3" if s3_service else "Local",
         "services": {
             "deepface": "operational",
             "database": db_status,
+            "s3": s3_status,
             "api": "operational"
         },
         "configuration": {
@@ -799,11 +883,12 @@ async def health_check(db: Session = Depends(get_db)):
             "anti_spoofing": face_service.anti_spoofing,
             "threshold": face_service.thresholds.get(face_service.model_name, {}).get(face_service.distance_metric, "N/A")
         },
+        "s3_info": s3_info,
         "performance": {
             "min_quality_score": face_service.min_quality_score,
             "min_face_confidence": face_service.min_face_confidence
         },
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
 @app.get("/api/v1/stats")
@@ -813,6 +898,10 @@ async def get_system_stats(db: Session = Depends(get_db)):
         # Count registered users
         total_users = db.query(AppUser).filter(AppUser.Active == True).count()
         registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        
+        # Count by storage type
+        s3_faces = db.query(Face).filter(Face.IsActive == True, Face.StorageType == "s3").count()
+        local_faces = db.query(Face).filter(Face.IsActive == True, Face.StorageType == "local").count()
         
         # Count verifications in last 24 hours
         from datetime import timedelta
@@ -832,6 +921,10 @@ async def get_system_stats(db: Session = Depends(get_db)):
             "total_users": total_users,
             "registered_faces": registered_faces,
             "registration_rate": (registered_faces / total_users * 100) if total_users > 0 else 0,
+            "storage_distribution": {
+                "s3": s3_faces,
+                "local": local_faces
+            },
             "recent_verifications_24h": recent_verifications,
             "success_rate_24h": success_rate,
             "system_health": "excellent" if success_rate > 95 else "good" if success_rate > 85 else "needs_attention"
@@ -840,6 +933,40 @@ async def get_system_stats(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error getting system stats: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to get system statistics")
+
+@app.post("/api/v1/admin/cleanup")
+async def cleanup_old_images(
+    days: int = 30,
+    db: Session = Depends(get_db)
+):
+    """Clean up old verification images from S3"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    try:
+        deleted_count = s3_service.cleanup_old_images(days)
+        return {
+            "success": True,
+            "deleted_images": deleted_count,
+            "days_threshold": days,
+            "message": f"Cleaned up {deleted_count} old verification images"
+        }
+    except Exception as e:
+        logger.error(f"Error during cleanup: {str(e)}")
+        raise HTTPException(status_code=500, detail="Cleanup failed")
+
+@app.get("/api/v1/admin/s3/status")
+async def get_s3_status():
+    """Get S3 bucket status and statistics"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not configured")
+    
+    try:
+        bucket_info = s3_service.check_bucket_health()
+        return bucket_info
+    except Exception as e:
+        logger.error(f"Error getting S3 status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get S3 status")
 
 if __name__ == "__main__":
     import uvicorn
