@@ -125,7 +125,7 @@ class Face(Base):
     RegistrationSource = Column(String(50), default="api")  # api, mobile, web
     
     CreationDateTime = Column(TIMESTAMP, server_default=func.now())
-    UpdationDateTime = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    UpdateDateTime = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 class FaceVerification(Base):
     """New table for verification audit trail"""
@@ -177,7 +177,7 @@ class DeepFaceRecognitionService:
         self.distance_metric = os.getenv("DEEPFACE_DISTANCE", "cosine")
         self.enforce_detection = True
         self.align = True
-        self.anti_spoofing = True
+        self.anti_spoofing = False
         
         # Optimized thresholds for different models
         self.thresholds = {
