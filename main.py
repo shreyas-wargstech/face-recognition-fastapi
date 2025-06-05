@@ -139,7 +139,7 @@ class Face(Base):
     StorageType = Column(String(20), default="s3")  # s3, local, base64
     
     CreationDateTime = Column(TIMESTAMP, server_default=func.now())
-    UpdationDateTime = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    UpdateDateTime = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 class FaceVerification(Base):
     """Enhanced verification table with S3 storage"""
@@ -194,7 +194,7 @@ class DeepFaceRecognitionService:
         self.distance_metric = os.getenv("DEEPFACE_DISTANCE", "cosine")
         self.enforce_detection = True
         self.align = True
-        self.anti_spoofing = True
+        self.anti_spoofing = False
         
         # Optimized thresholds for different models
         self.thresholds = {
