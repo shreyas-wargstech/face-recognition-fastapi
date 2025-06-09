@@ -74,6 +74,10 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ENCRYPTION_KEY = os.getenv("FACE_ENCRYPTION_KEY", Fernet.generate_key())
 cipher_suite = Fernet(ENCRYPTION_KEY)
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Initialize S3 service
 try:
     s3_service = S3Service()
@@ -82,9 +86,6 @@ except Exception as e:
     logger.error(f"❌ Failed to initialize S3 service: {str(e)}")
     s3_service = None
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Database Models - Updated with S3 fields
 class AppUser(Base):
@@ -409,38 +410,58 @@ def decrypt_face_encoding(encrypted_data: bytes) -> np.ndarray:
 
 def save_image_to_storage(file: UploadFile, user_id: int, image_type: str) -> Dict[str, str]:
     """
-    Save image to S3 or local storage (fallback)
-    Returns dict with storage info
+    Save image to S3 with enhanced folder structure or local storage (fallback)
+    
+    Args:
+        file: UploadFile object
+        user_id: User ID for partitioning
+        image_type: Type of image ('registration', 'verification', 'verification_failed')
+    
+    Returns:
+        Dictionary with storage information
     """
     if s3_service:
         try:
             s3_key, s3_url = s3_service.upload_face_image(file, user_id, image_type)
+            
+            logger.info(f"📁 Stored {image_type} image for user {user_id} in partition {s3_service._get_user_partition(user_id)}")
+            
             return {
                 "storage_type": "s3",
                 "s3_key": s3_key,
                 "s3_url": s3_url,
-                "path": s3_url  # For backward compatibility
+                "path": s3_url,  # For backward compatibility
+                "partition": s3_service._get_user_partition(user_id),
+                "folder_structure": "partitioned"
             }
         except Exception as e:
-            logger.error(f"S3 upload failed, falling back to local storage: {str(e)}")
+            logger.error(f"S3 upload failed for user {user_id}, falling back to local storage: {str(e)}")
     
-    # Fallback to local storage
+    # Fallback to local storage with similar folder structure
     upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
+    user_partition = f"partition_{((user_id - 1) // 1000) + 1:04d}"  # Same partitioning logic
+    user_folder = os.path.join(upload_dir, image_type, user_partition, f"user_{user_id}")
+    
+    os.makedirs(user_folder, exist_ok=True)
     
     file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-    filename = f"{user_id}_{image_type}_{uuid.uuid4().hex}.{file_extension}"
-    file_path = os.path.join(upload_dir, filename)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"{image_type}_{timestamp}.{file_extension}"
+    file_path = os.path.join(user_folder, filename)
     
     file.file.seek(0)
     with open(file_path, "wb") as buffer:
         buffer.write(file.file.read())
     
+    logger.info(f"💾 Stored {image_type} image for user {user_id} locally in {user_folder}")
+    
     return {
         "storage_type": "local",
         "s3_key": None,
         "s3_url": None,
-        "path": file_path
+        "path": file_path,
+        "partition": user_partition,
+        "folder_structure": "partitioned"
     }
 
 def convert_numpy_types(obj):
@@ -954,6 +975,352 @@ async def cleanup_old_images(
     except Exception as e:
         logger.error(f"Error during cleanup: {str(e)}")
         raise HTTPException(status_code=500, detail="Cleanup failed")
+
+@app.post("/api/v1/admin/setup-lifecycle")
+async def setup_s3_lifecycle_policies():
+    """Setup S3 lifecycle policies for automatic cost optimization"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    try:
+        s3_service.setup_lifecycle_policies()
+        return {
+            "success": True,
+            "message": "S3 lifecycle policies configured successfully",
+            "policies": [
+                "Verification images: STANDARD -> STANDARD_IA (30d) -> GLACIER (90d) -> DEEP_ARCHIVE (365d) -> DELETE (7y)",
+                "Registration images: STANDARD -> STANDARD_IA (90d) -> GLACIER (365d)",
+                "Failed uploads: Auto-cleanup incomplete multipart uploads (7d)"
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error setting up lifecycle policies: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to setup lifecycle policies: {str(e)}")
+
+@app.post("/api/v1/admin/migrate-images")
+async def migrate_existing_images(batch_size: int = 100):
+    """Migrate existing images to new partitioned folder structure"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    try:
+        migrated_count = s3_service.migrate_existing_images(batch_size)
+        return {
+            "success": True,
+            "migrated_images": migrated_count,
+            "batch_size": batch_size,
+            "message": f"Successfully migrated {migrated_count} images to new folder structure"
+        }
+    except Exception as e:
+        logger.error(f"Error during migration: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+@app.get("/api/v1/admin/user/{user_id}/images")
+async def get_user_images(
+    user_id: int,
+    image_type: str = None,  # Optional filter: 'registration', 'verification', 'verification_failed'
+    db: Session = Depends(get_db)
+):
+    """Get all images for a specific user"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    try:
+        # Verify user exists
+        user = db.query(AppUser).filter(AppUser.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        images = s3_service.get_user_images(user_id, image_type)
+        
+        return {
+            "user_id": user_id,
+            "user_name": user.Name,
+            "partition": s3_service._get_user_partition(user_id),
+            "image_type_filter": image_type,
+            "total_images": len(images),
+            "images": images
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user images for user {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get user images: {str(e)}")
+
+@app.get("/api/v1/admin/partition/{partition_id}/stats")
+async def get_partition_stats(partition_id: str):
+    """Get statistics for a specific partition"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    try:
+        # Validate partition format
+        if not partition_id.startswith("partition_"):
+            raise HTTPException(status_code=400, detail="Invalid partition format. Use 'partition_XXXX'")
+        
+        # Calculate user range for this partition
+        try:
+            partition_num = int(partition_id.split("_")[1])
+            users_per_partition = s3_service.users_per_partition
+            start_user = ((partition_num - 1) * users_per_partition) + 1
+            end_user = partition_num * users_per_partition
+        except (IndexError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid partition number")
+        
+        # Get partition statistics from S3
+        total_objects = 0
+        total_size = 0
+        registration_count = 0
+        verification_count = 0
+        
+        # Search in registration folder
+        reg_prefix = f"{s3_service.base_folder}/registrations/{partition_id}/"
+        paginator = s3_service.s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=s3_service.bucket_name, Prefix=reg_prefix)
+        
+        for page in pages:
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    total_objects += 1
+                    total_size += obj['Size']
+                    registration_count += 1
+        
+        # Search in verification folders (multiple date partitions)
+        ver_prefix = f"{s3_service.base_folder}/verifications/"
+        pages = paginator.paginate(Bucket=s3_service.bucket_name, Prefix=ver_prefix)
+        
+        for page in pages:
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    if f"/{partition_id}/" in obj['Key']:
+                        total_objects += 1
+                        total_size += obj['Size']
+                        verification_count += 1
+        
+        return {
+            "partition_id": partition_id,
+            "partition_number": partition_num,
+            "user_range": {
+                "start": start_user,
+                "end": end_user,
+                "total_capacity": users_per_partition
+            },
+            "storage_stats": {
+                "total_objects": total_objects,
+                "total_size_bytes": total_size,
+                "total_size_mb": round(total_size / 1024 / 1024, 2),
+                "registration_images": registration_count,
+                "verification_images": verification_count
+            },
+            "folder_structure": {
+                "registrations_path": reg_prefix,
+                "verifications_path": f"{ver_prefix}*/*/partition_{partition_num:04d}/",
+                "base_folder": s3_service.base_folder
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting partition stats for {partition_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get partition statistics: {str(e)}")
+
+@app.get("/api/v1/admin/storage/overview")
+async def get_storage_overview(db: Session = Depends(get_db)):
+    """Get comprehensive storage overview across all partitions"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    try:
+        # Get database statistics
+        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
+        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        total_verifications = db.query(FaceVerification).count()
+        
+        # Calculate partition usage
+        max_partition = ((total_users - 1) // s3_service.users_per_partition) + 1
+        active_partitions = max_partition
+        
+        # Get S3 bucket health
+        bucket_health = s3_service.check_bucket_health()
+        
+        # Calculate storage efficiency
+        storage_distribution = {
+            "s3": db.query(Face).filter(Face.IsActive == True, Face.StorageType == "s3").count(),
+            "local": db.query(Face).filter(Face.IsActive == True, Face.StorageType == "local").count()
+        }
+        
+        # Estimate costs (approximate)
+        estimated_monthly_cost = {
+            "standard": bucket_health.get("total_size_mb", 0) * 0.023 / 1024,  # $0.023 per GB
+            "standard_ia": bucket_health.get("total_size_mb", 0) * 0.0125 / 1024,  # $0.0125 per GB
+            "note": "Estimates based on AWS S3 pricing, actual costs may vary"
+        }
+        
+        return {
+            "database_stats": {
+                "total_users": total_users,
+                "registered_faces": registered_faces,
+                "total_verifications": total_verifications,
+                "registration_rate": (registered_faces / total_users * 100) if total_users > 0 else 0
+            },
+            "partition_stats": {
+                "users_per_partition": s3_service.users_per_partition,
+                "active_partitions": active_partitions,
+                "max_partition_number": max_partition,
+                "partition_efficiency": (total_users / (active_partitions * s3_service.users_per_partition) * 100) if active_partitions > 0 else 0
+            },
+            "storage_distribution": storage_distribution,
+            "s3_bucket_health": bucket_health,
+            "folder_structure": {
+                "base_folder": s3_service.base_folder,
+                "registrations_path": f"{s3_service.base_folder}/registrations/partition_XXXX/user_YYYY/",
+                "verifications_path": f"{s3_service.base_folder}/verifications/YYYY/MM/[successful|failed]/partition_XXXX/user_YYYY/",
+                "lifecycle_policies": "configured"
+            },
+            "estimated_costs": estimated_monthly_cost,
+            "recommendations": {
+                "partition_health": "healthy" if active_partitions < 100 else "monitor" if active_partitions < 500 else "consider_optimization",
+                "storage_optimization": "enabled" if bucket_health.get("status") == "healthy" else "needs_attention"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting storage overview: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get storage overview: {str(e)}")
+
+@app.delete("/api/v1/admin/user/{user_id}/images")
+async def delete_user_images(
+    user_id: int,
+    image_type: str = None,  # Optional: 'registration', 'verification', 'all'
+    confirm: bool = False,
+    db: Session = Depends(get_db)
+):
+    """Delete all images for a specific user (with confirmation)"""
+    if not s3_service:
+        raise HTTPException(status_code=503, detail="S3 service not available")
+    
+    if not confirm:
+        raise HTTPException(
+            status_code=400, 
+            detail="This operation requires confirmation. Add '?confirm=true' to proceed."
+        )
+    
+    try:
+        # Verify user exists
+        user = db.query(AppUser).filter(AppUser.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Get all user images
+        images = s3_service.get_user_images(user_id, image_type)
+        
+        deleted_count = 0
+        failed_deletions = []
+        
+        for image in images:
+            try:
+                if s3_service.delete_image(image['key']):
+                    deleted_count += 1
+                else:
+                    failed_deletions.append(image['key'])
+            except Exception as e:
+                logger.error(f"Failed to delete {image['key']}: {str(e)}")
+                failed_deletions.append(image['key'])
+        
+        # Update database records if deleting registration images
+        if image_type in [None, "registration", "all"]:
+            face_records = db.query(Face).filter(Face.UserID == user_id, Face.IsActive == True).all()
+            for face in face_records:
+                face.IsActive = False
+                face.S3Key = None
+                face.S3Url = None
+            db.commit()
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "user_name": user.Name,
+            "deleted_images": deleted_count,
+            "failed_deletions": len(failed_deletions),
+            "failed_keys": failed_deletions[:10],  # Show first 10 failed deletions
+            "image_type_filter": image_type,
+            "message": f"Deleted {deleted_count} images for user {user_id}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user images for user {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete user images: {str(e)}")
+
+# Enhanced stats endpoint with partition information
+@app.get("/api/v1/stats")
+async def get_system_stats(db: Session = Depends(get_db)):
+    """Get enhanced system statistics with partition information"""
+    try:
+        # Existing statistics
+        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
+        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        
+        # Storage distribution
+        s3_faces = db.query(Face).filter(Face.IsActive == True, Face.StorageType == "s3").count()
+        local_faces = db.query(Face).filter(Face.IsActive == True, Face.StorageType == "local").count()
+        
+        # Verification statistics
+        from datetime import timedelta
+        yesterday = datetime.utcnow() - timedelta(days=1)
+        recent_verifications = db.query(FaceVerification).filter(
+            FaceVerification.VerificationDateTime >= yesterday
+        ).count()
+        
+        successful_verifications = db.query(FaceVerification).filter(
+            FaceVerification.VerificationDateTime >= yesterday,
+            FaceVerification.VerificationResult == True
+        ).count()
+        
+        success_rate = (successful_verifications / recent_verifications * 100) if recent_verifications > 0 else 0
+        
+        # Enhanced partition statistics
+        partition_stats = {}
+        if s3_service:
+            users_per_partition = s3_service.users_per_partition
+            max_partition = ((total_users - 1) // users_per_partition) + 1 if total_users > 0 else 0
+            
+            partition_stats = {
+                "users_per_partition": users_per_partition,
+                "active_partitions": max_partition,
+                "partition_efficiency": (total_users / (max_partition * users_per_partition) * 100) if max_partition > 0 else 0,
+                "max_supported_users": max_partition * users_per_partition,
+                "next_partition_threshold": max_partition * users_per_partition + 1,
+                "folder_structure": "partitioned" if s3_service else "flat"
+            }
+        
+        return {
+            "total_users": total_users,
+            "registered_faces": registered_faces,
+            "registration_rate": (registered_faces / total_users * 100) if total_users > 0 else 0,
+            "storage_distribution": {
+                "s3": s3_faces,
+                "local": local_faces,
+                "s3_percentage": (s3_faces / registered_faces * 100) if registered_faces > 0 else 0
+            },
+            "partition_statistics": partition_stats,
+            "recent_verifications_24h": recent_verifications,
+            "success_rate_24h": success_rate,
+            "system_health": "excellent" if success_rate > 95 else "good" if success_rate > 85 else "needs_attention",
+            "storage_type": "s3_partitioned" if s3_service else "local_partitioned",
+            "scalability": {
+                "current_scale": "small" if total_users < 10000 else "medium" if total_users < 100000 else "large",
+                "partition_ready": True if s3_service else False,
+                "estimated_capacity": "500K+ users" if s3_service else "Limited by local storage"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting enhanced system stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get system statistics")
 
 @app.get("/api/v1/admin/s3/status")
 async def get_s3_status():
