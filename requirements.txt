@@ -1,8 +1,136 @@
+# requirements.txt - Updated for Real-Time Face Recognition with DeepFace Streaming
+
+# Core FastAPI and async support
+fastapi==0.115.12
+uvicorn[standard]==0.24.0
+websockets==15.0.1
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+
+# Database
+SQLAlchemy==2.0.23
+PyMySQL==1.1.0
+psycopg2-binary==2.9.9
+
+# DeepFace and AI/ML dependencies
+deepface==0.0.93
+tensorflow==2.19.0
+tf-keras==2.19.0
+keras==3.10.0
+
+# Computer Vision
+opencv-python==4.8.1.78
+Pillow==10.1.0
+numpy==1.26.4
+scipy==1.13.0
+
+# Face Recognition Models and Backends
+mtcnn==1.0.0
+retina-face==0.0.17
+dlib==20.0.0
+face-recognition==1.3.0
+face-recognition-models==0.3.0
+
+# Security and Encryption
+cryptography==41.0.7
+passlib[bcrypt]==1.7.4
+bcrypt==4.3.0
+
+# Environment and Configuration
+python-dotenv==1.1.0
+pydantic==2.11.5
+pydantic-core==2.33.2
+
+# AWS S3 Support (optional)
+boto3==1.35.72
+botocore==1.35.72
+
+# Async and Threading
+# asyncio-mqtt==0.16.2
+# asyncio==3.4.3
+# concurrent-futures==3.1.1
+
+# Data Processing
+pandas==2.2.3
+pickle-mixin==1.0.2
+
+# HTTP and API
+requests==2.32.3
+httpx==0.28.1
+aiofiles==23.2.1
+
+# Monitoring and Logging
+structlog==24.1.0
+rich==14.0.0
+
+# Image Processing and Quality Assessment
+scikit-image==0.22.0
+imageio==2.34.0
+
+# Performance and Memory Management
+psutil==5.9.8
+memory-profiler==0.61.0
+
+# Utilities
+uuid==1.30
+typing-extensions==4.13.2
+python-dateutil==2.9.0.post0
+
+# Development and Testing (optional)
+pytest==8.0.0
+pytest-asyncio==0.23.5
+httpx==0.28.1
+
+# Additional ML utilities
+scikit-learn==1.4.1.post1
+joblib==1.5.1
+
+# Anti-spoofing specific dependencies
+torch==2.2.1
+torchvision==0.17.1
+# silent-face-anti-spoofing==1.0.0
+
+# WebSocket support enhancements
+websocket-client==1.7.0
+python-socketio==5.10.0
+
+# Background task processing
+celery==5.3.6
+redis==5.0.1
+
+# Model optimization
+onnx==1.15.0
+onnxruntime==1.17.1
+
+# Additional face analysis
+# mediapipe==0.10.9
+
+# Error handling and monitoring
+#sentry-sdk[fastapi]==1.40.0
+
+# CORS and middleware
+starlette==0.46.2
+
+# JSON and serialization
+orjson==3.9.15
+
+# Quality control and validation
+jsonschema==4.21.1
+
+# System monitoring
+py-cpuinfo==9.0.0
+
+# Timezone handling
+pytz==2025.2
+
+# File handling
+aiofiles==23.2.1
+
+# Base dependencies that were in original
 absl-py==2.3.0
 annotated-types==0.7.0
 anyio==4.9.0
 astunparse==1.6.3
-bcrypt==4.3.0
 beautifulsoup4==4.13.4
 blinker==1.9.0
 boto3==1.35.72
@@ -11,17 +139,9 @@ certifi==2025.4.26
 cffi==1.17.1
 charset-normalizer==3.4.2
 click==8.2.1
-cryptography==41.0.7
-deepface==0.0.93
-dlib==20.0.0
 dnspython==2.7.0
-dotenv==0.9.9
 ecdsa==0.19.1
-email_validator==2.2.0
-face-recognition==1.3.0
-face_recognition_models==0.3.0
-fastapi==0.115.12
-fastapi-cli==0.0.7
+email-validator==2.2.0
 filelock==3.18.0
 fire==0.7.0
 Flask==3.1.1
@@ -37,73 +157,51 @@ h11==0.16.0
 h5py==3.13.0
 httpcore==1.0.9
 httptools==0.6.4
-httpx==0.28.1
 idna==3.10
 itsdangerous==2.2.0
 jmespath==1.0.1
 Jinja2==3.1.6
-joblib==1.5.1
-keras==3.10.0
 libclang==18.1.1
 lz4==4.4.4
 Markdown==3.8
 markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 mdurl==0.1.2
-ml_dtypes==0.5.1
-mtcnn==1.0.0
+ml-dtypes==0.5.1
 namex==0.1.0
-numpy==1.26.4
-opencv-python==4.8.1.78
-opt_einsum==3.4.0
+opt-einsum==3.4.0
 optree==0.16.0
 packaging==25.0
-pandas==2.2.3
-passlib==1.7.4
-Pillow==10.1.0
 protobuf==5.29.5
-psycopg2-binary==2.9.9
 pyasn1==0.6.1
 pycparser==2.22
-pydantic==2.11.5
-pydantic_core==2.33.2
 Pygments==2.19.1
-PyMySQL==1.1.0
 PySocks==1.7.1
-python-dateutil==2.9.0.post0
-python-dotenv==1.1.0
-python-jose==3.3.0
-python-multipart==0.0.6
-pytz==2025.2
 PyYAML==6.0.2
+<<<<<<< Updated upstream
 requests==2.32.3
 retina-face==0.0.17
 rich==14.0.0
 rich-toolkit==0.14.7
 rsa==4.9.1
+=======
+>>>>>>> Stashed changes
 s3transfer==0.10.4
 setuptools==80.9.0
 shellingham==1.5.4
 six==1.17.0
 sniffio==1.3.1
 soupsieve==2.7
-SQLAlchemy==2.0.23
-starlette==0.46.2
 tensorboard==2.19.0
 tensorboard-data-server==0.7.2
-tensorflow==2.19.0
 termcolor==3.1.0
-tf_keras==2.19.0
 tqdm==4.67.1
 typer==0.16.0
 typing-inspection==0.4.1
-typing_extensions==4.13.2
 tzdata==2025.2
 urllib3==2.4.0
-uvicorn==0.24.0
 uvloop==0.21.0
 watchfiles==1.0.5
-websockets==15.0.1
 Werkzeug==3.1.3
 wheel==0.45.1
 wrapt==1.17.2
