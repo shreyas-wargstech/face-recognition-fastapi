@@ -1173,16 +1173,109 @@ async def optimized_face_verification_stream(
     finally:
         await manager.disconnect(session_id)
 
-# Add application lifespan management
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("🚀 Starting optimized face recognition service")
-    yield
-    # Shutdown
-    logger.info("🛑 Shutting down face recognition service")
-    if hasattr(face_service, 'executor'):
-        face_service.executor.shutdown(wait=True)
+@app.get("/api/v1/health")
+async def health_check(db: Session = Depends(get_db)):
+    """Comprehensive health check"""
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = "operational"
+    except:
+        db_status = "error"
+    
+    active_sessions = len(manager.active_connections)
+    
+    return {
+            "status": "healthy" if db_status == "operational" else "degraded",
+            "timestamp": datetime.utcnow().isoformat(),
+            "engine": "DeepFace",
+            "streaming": "enabled",
+            "anti_spoofing": face_service.anti_spoofing,
+            "services": {
+                "deepface": "operational",
+                "database": db_status,
+                "websocket": "operational",
+                "streaming": "operational"
+            },
+            "configuration": {
+                "model": face_service.model_name,
+                "detector": face_service.detector_backend,
+                "distance_metric": face_service.distance_metric,
+                "anti_spoofing": face_service.anti_spoofing,
+                "min_quality_score": face_service.min_quality_score,
+                "liveness_threshold": face_service.liveness_threshold
+            },
+            "active_sessions": active_sessions,
+            "version": "3.0.0"
+    }
 
-# Apply lifespan to app
-app = FastAPI(lifespan=lifespan)
+@app.get("/api/v1/stats")
+async def get_system_stats(db: Session = Depends(get_db)):
+    """Get system statistics including streaming data"""
+    try:
+        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
+        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        
+        # Streaming sessions statistics
+        from datetime import timedelta
+        yesterday = datetime.utcnow() - timedelta(days=1)
+        
+        recent_sessions = db.query(StreamingSession).filter(
+            StreamingSession.StartTime >= yesterday
+        ).count()
+        
+        successful_registrations = db.query(StreamingSession).filter(
+            StreamingSession.StartTime >= yesterday,
+            StreamingSession.SessionType == "registration",
+            StreamingSession.Status == "completed"
+        ).count()
+        
+        successful_verifications = db.query(StreamingSession).filter(
+            StreamingSession.StartTime >= yesterday,
+            StreamingSession.SessionType == "verification",
+            StreamingSession.Status == "completed"
+        ).count()
+        
+        # Enhanced partition statistics
+        partition_stats = {}
+        if s3_service:
+            users_per_partition = s3_service.users_per_partition
+            max_partition = ((total_users - 1) // users_per_partition) + 1 if total_users > 0 else 0
+            
+            partition_stats = {
+                "users_per_partition": users_per_partition,
+                "active_partitions": max_partition,
+                "partition_efficiency": (total_users / (max_partition * users_per_partition) * 100) if max_partition > 0 else 0,
+                "max_supported_users": max_partition * users_per_partition,
+                "next_partition_threshold": max_partition * users_per_partition + 1,
+                "folder_structure": "partitioned" if s3_service else "flat"
+            }
+        
+        return {
+            "total_users": total_users,
+            "registered_faces": registered_faces,
+            "registration_rate": (registered_faces / total_users * 100) if total_users > 0 else 0,
+            "active_streaming_sessions": len(manager.active_connections),
+            "recent_sessions_24h": recent_sessions,
+            "successful_registrations_24h": successful_registrations,
+            "successful_verifications_24h": successful_verifications,
+            "streaming_success_rate": (
+                (successful_registrations + successful_verifications) / recent_sessions * 100
+                if recent_sessions > 0 else 0
+            ),
+            "system_health": "excellent"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting enhanced system stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get system statistics")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        workers=1,  # Single worker for WebSocket support
+        log_level="info"
+    )
