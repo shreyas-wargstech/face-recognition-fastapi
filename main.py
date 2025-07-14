@@ -31,6 +31,20 @@ from dotenv import load_dotenv
 import gc
 import traceback
 
+# Import authentication system
+from auth import (
+    AuthenticatedUser, 
+    get_current_user, 
+    get_current_active_user, 
+    get_admin_user,
+    verify_user_access,
+    validate_user_access,
+    auth_health_check,
+    create_test_token,
+    AuthenticationError,
+    PermissionError
+)
+
 load_dotenv()
 
 # Initialize FastAPI app
@@ -605,20 +619,55 @@ class OptimizedConnectionManager:
 manager = OptimizedConnectionManager()
 face_service = OptimizedFaceRecognitionService()
 
+# Authentication helper for WebSocket connections
+async def authenticate_websocket_user(user_id: int, token: Optional[str] = None) -> Optional[AuthenticatedUser]:
+    """
+    Authenticate user for WebSocket connections
+    Token can be passed as query parameter or header
+    """
+    if not token:
+        return None
+    
+    try:
+        from auth import decode_jwt_token, AuthenticatedUser
+        payload = decode_jwt_token(token)
+        user = AuthenticatedUser(payload)
+        
+        # Validate user ID matches token
+        if user.id != user_id:
+            logger.warning(f"User ID mismatch: token={user.id}, requested={user_id}")
+            return None
+        
+        return user
+    except Exception as e:
+        logger.error(f"WebSocket authentication error: {str(e)}")
+        return None
+
 # WebSocket Endpoints
 @app.websocket("/ws/face-registration/{user_id}")
-async def optimized_face_registration_stream(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
-    """Optimized real-time face registration with proper timeout handling"""
+async def optimized_face_registration_stream(
+    websocket: WebSocket, 
+    user_id: int, 
+    token: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Optimized real-time face registration with authentication"""
     session_id = f"reg_{user_id}_{uuid.uuid4().hex[:8]}"
     
     try:
+        # Authenticate user (optional for WebSocket - can be anonymous)
+        authenticated_user = await authenticate_websocket_user(user_id, token)
+        
         # Check if user exists
         user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
         if not user:
             await websocket.close(code=4004, reason="User not found")
             return
         
-        await manager.connect(websocket, session_id, user_id, "registration")
+        # Connect WebSocket
+        connected = await manager.connect(websocket, session_id, user_id, "registration", authenticated_user)
+        if not connected:
+            return
         
         # Send initial status
         await manager.send_message(session_id, {
@@ -626,9 +675,13 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
             "session_id": session_id,
             "user_id": user_id,
             "user_name": user.Name,
+            "authenticated": authenticated_user is not None,
             "required_frames": face_service.required_frames,
             "message": "Ready for face registration. Please look at the camera."
         })
+        
+        # Continue with the same registration logic as before...
+        # (The rest of the registration logic remains the same)
         
         best_frames = []
         quality_scores = []
@@ -636,7 +689,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
         
         while True:
             try:
-                # Receive frame with timeout
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 message_data = json.loads(data)
                 
@@ -645,10 +697,9 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                     if not connection:
                         break
                     
-                    # Check if already processing
                     async with manager.processing_locks[session_id]:
                         if connection.get("processing", False):
-                            continue  # Skip if still processing previous frame
+                            continue
                         
                         connection["processing"] = True
                     
@@ -656,11 +707,9 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                         frame_data = message_data["frame"]
                         connection["frame_count"] += 1
                         
-                        # Skip frames for performance (process every Nth frame)
                         if connection["frame_count"] % face_service.frame_skip != 0:
                             continue
                         
-                        # Validate frame data first
                         if not validate_frame_data(frame_data):
                             await manager.send_message(session_id, {
                                 "type": "error",
@@ -668,7 +717,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                             })
                             continue
                         
-                        # Decode frame
                         frame = decode_base64_frame(frame_data)
                         if frame is None:
                             await manager.send_message(session_id, {
@@ -677,7 +725,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                             })
                             continue
                         
-                        # Process frame asynchronously with timeout
                         process_start = time.time()
                         result = await face_service.extract_face_async(frame, timeout=10.0)
                         process_time = time.time() - process_start
@@ -685,7 +732,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                         frame_processing_times.append(process_time)
                         connection["processed_count"] += 1
                         
-                        # Handle spoofing detection
                         if result.get("spoofing_detected", False):
                             await manager.send_message(session_id, {
                                 "type": "spoofing_detected",
@@ -705,7 +751,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                             })
                             continue
                         
-                        # More lenient quality check
                         quality_score = result.get("quality_score", 0)
                         if quality_score < face_service.min_quality_score:
                             await manager.send_message(session_id, {
@@ -719,7 +764,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                             })
                             continue
                         
-                        # Store good frame
                         best_frames.append({
                             "encoding": result.get("encoding"),
                             "quality_score": quality_score,
@@ -741,23 +785,17 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                             "message": f"Good frame! ({len(best_frames)}/{face_service.required_frames})"
                         })
                         
-                        # Check if we have enough frames
                         if len(best_frames) >= face_service.required_frames:
-                            # Select best frame
                             best_frame = max(best_frames, key=lambda x: x["quality_score"])
                             
-                            # Calculate averages
                             avg_quality = sum(quality_scores) / len(quality_scores)
                             avg_antispoofing = sum(f["antispoofing_score"] for f in best_frames) / len(best_frames)
                             avg_processing_time = sum(frame_processing_times) / len(frame_processing_times)
                             
                             try:
-                                # Database operations with timeout
                                 async with asyncio.timeout(10.0):
-                                    # Encrypt and store face encoding
                                     encrypted_embedding = encrypt_face_encoding(best_frame["encoding"])
                                     
-                                    # Deactivate existing registration
                                     existing_face = db.query(Face).filter(
                                         Face.UserID == user_id,
                                         Face.IsActive == True
@@ -766,7 +804,6 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                                     if existing_face:
                                         existing_face.IsActive = False
                                     
-                                    # Create new face registration
                                     new_face = Face(
                                         UserID=user_id,
                                         FaceEmbedding=encrypted_embedding,
@@ -775,7 +812,7 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                                         DetectorBackend=face_service.detector_backend,
                                         QualityScore=avg_quality,
                                         FaceConfidence=best_frame["face_confidence"],
-                                        RegistrationSource="stream_v2"
+                                        RegistrationSource="stream_v3_auth"
                                     )
                                     
                                     db.add(new_face)
@@ -794,11 +831,12 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                                         "frames_processed": len(best_frames),
                                         "avg_processing_time": avg_processing_time,
                                         "model_name": face_service.model_name,
-                                        "registration_source": "stream_v2",
+                                        "registration_source": "stream_v3_auth",
+                                        "authenticated": authenticated_user is not None,
                                         "message": "Face registration completed successfully!"
                                     })
                                     
-                                    logger.info(f"✅ Face registered for user {user_id} in {avg_processing_time:.2f}s avg")
+                                    logger.info(f"✅ Face registered for {user.Name} (ID: {user_id}) in {avg_processing_time:.2f}s avg")
                                     break
                                     
                             except asyncio.TimeoutError:
@@ -870,12 +908,16 @@ async def optimized_face_verification_stream(
     user_id: int, 
     quiz_id: Optional[str] = None,
     course_id: Optional[str] = None,
+    token: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Optimized real-time face verification with proper timeout handling"""
+    """Optimized real-time face verification with authentication"""
     session_id = f"ver_{user_id}_{uuid.uuid4().hex[:8]}"
     
     try:
+        # Authenticate user
+        authenticated_user = await authenticate_websocket_user(user_id, token)
+        
         # Check if user exists
         user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
         if not user:
@@ -892,7 +934,10 @@ async def optimized_face_verification_stream(
             await websocket.close(code=4003, reason="No face registration found")
             return
         
-        await manager.connect(websocket, session_id, user_id, "verification")
+        # Connect WebSocket
+        connected = await manager.connect(websocket, session_id, user_id, "verification", authenticated_user)
+        if not connected:
+            return
         
         # Send initial status
         await manager.send_message(session_id, {
@@ -902,16 +947,19 @@ async def optimized_face_verification_stream(
             "user_name": user.Name,
             "quiz_id": quiz_id,
             "course_id": course_id,
-            "required_frames": 2,  # Optimized for verification
+            "authenticated": authenticated_user is not None,
+            "required_frames": 2,
             "message": "Ready for face verification. Please look at the camera."
         })
+        
+        # Continue with verification logic...
+        # (The rest of the verification logic remains similar but with authentication context)
         
         verification_frames = []
         similarity_scores = []
         frame_processing_times = []
         registered_encoding = None
         
-        # Decrypt the registered face encoding
         try:
             registered_encoding = decrypt_face_encoding(registered_face.FaceEmbedding)
         except Exception as e:
@@ -924,7 +972,6 @@ async def optimized_face_verification_stream(
         
         while True:
             try:
-                # Receive frame with timeout
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 message_data = json.loads(data)
                 
@@ -933,7 +980,6 @@ async def optimized_face_verification_stream(
                     if not connection:
                         break
                     
-                    # Check if already processing
                     async with manager.processing_locks[session_id]:
                         if connection.get("processing", False):
                             continue
@@ -944,11 +990,9 @@ async def optimized_face_verification_stream(
                         frame_data = message_data["frame"]
                         connection["frame_count"] += 1
                         
-                        # Process every 4th frame for faster verification
                         if connection["frame_count"] % 4 != 0:
                             continue
                         
-                        # Validate frame data
                         if not validate_frame_data(frame_data):
                             await manager.send_message(session_id, {
                                 "type": "error",
@@ -956,7 +1000,6 @@ async def optimized_face_verification_stream(
                             })
                             continue
                         
-                        # Decode frame
                         frame = decode_base64_frame(frame_data)
                         if frame is None:
                             await manager.send_message(session_id, {
@@ -965,7 +1008,6 @@ async def optimized_face_verification_stream(
                             })
                             continue
                         
-                        # Process frame asynchronously
                         process_start = time.time()
                         result = await face_service.extract_face_async(frame, timeout=8.0)
                         
@@ -989,9 +1031,8 @@ async def optimized_face_verification_stream(
                             })
                             continue
                         
-                        # Relaxed quality check for verification (lower threshold)
                         quality_score = result.get("quality_score", 0)
-                        if quality_score < 10.0:  # More lenient than registration
+                        if quality_score < 10.0:
                             await manager.send_message(session_id, {
                                 "type": "frame_processed",
                                 "success": False,
@@ -1003,7 +1044,6 @@ async def optimized_face_verification_stream(
                             })
                             continue
                         
-                        # Compare with registered face
                         current_encoding = result.get("encoding")
                         comparison_start = time.time()
                         comparison_result = face_service.compare_faces_with_verification(
@@ -1041,29 +1081,24 @@ async def optimized_face_verification_stream(
                             "message": f"Verification progress: {similarity_score:.1f}% similarity ({'Match' if is_match else 'No match'})"
                         })
                         
-                        # Check if we have enough frames for verification
                         if len(verification_frames) >= 2:
-                            # Calculate verification result using multiple criteria
                             max_similarity = max(similarity_scores)
                             avg_similarity = sum(similarity_scores) / len(similarity_scores)
                             match_count = sum(1 for frame in verification_frames if frame["is_match"])
                             match_ratio = match_count / len(verification_frames)
                             
-                            # Enhanced verification logic
                             verified = (
-                                max_similarity >= 55.0 or  # At least one good match
-                                (avg_similarity >= 45.0 and match_ratio >= 0.5) or  # Good average with some matches
-                                match_count >= 1  # At least one frame matched
+                                max_similarity >= 55.0 or
+                                (avg_similarity >= 45.0 and match_ratio >= 0.5) or
+                                match_count >= 1
                             )
                             
-                            # Calculate averages
                             avg_quality = sum(f["quality_score"] for f in verification_frames) / len(verification_frames)
                             avg_antispoofing = sum(f["antispoofing_score"] for f in verification_frames) / len(verification_frames)
                             avg_processing_time = sum(frame_processing_times) / len(frame_processing_times)
                             confidence_score = max(f["confidence"] for f in verification_frames)
                             
                             try:
-                                # Store verification result
                                 verification_record = FaceVerification(
                                     UserID=user_id,
                                     QuizID=quiz_id,
@@ -1103,12 +1138,14 @@ async def optimized_face_verification_stream(
                                     "processing_time": avg_processing_time,
                                     "avg_processing_time": avg_processing_time,
                                     "model_name": face_service.model_name,
-                                    "verification_method": "optimized_stream",
+                                    "verification_method": "optimized_stream_auth",
                                     "threshold_used": 55.0,
+                                    "authenticated": authenticated_user is not None,
                                     "message": "Identity verified successfully!" if verified else "Identity verification failed"
                                 })
                                 
-                                logger.info(f"✅ Face verification completed for user {user_id}: {verified} ({max_similarity:.1f}%)")
+                                auth_info = f" (authenticated as {authenticated_user.name})" if authenticated_user else " (anonymous)"
+                                logger.info(f"✅ Face verification completed for user {user_id}{auth_info}: {verified} ({max_similarity:.1f}%)")
                                 break
                                 
                             except Exception as e:
@@ -1128,7 +1165,6 @@ async def optimized_face_verification_stream(
                 elif message_data.get("type") == "stop":
                     break
                 elif message_data.get("type") == "restart_verification":
-                    # Reset verification state
                     verification_frames = []
                     similarity_scores = []
                     frame_processing_times = []
@@ -1187,18 +1223,21 @@ async def optimized_face_verification_stream(
             pass
     finally:
         await manager.disconnect(session_id)
-
+        
 # API Endpoints
 @app.get("/api/v1/face/status/{user_id}")
-async def get_face_status(user_id: int, db: Session = Depends(get_db)):
-    """Get face registration status for a user"""
+async def get_face_status(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(verify_user_access)
+):
+    """Get face registration status for a user - PROTECTED"""
     try:
-        # Check if user exists
+        # User verification is handled by verify_user_access dependency
         user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Check for active face registration
         face_record = db.query(Face).filter(
             Face.UserID == user_id,
             Face.IsActive == True
@@ -1215,13 +1254,15 @@ async def get_face_status(user_id: int, db: Session = Depends(get_db)):
                 "model_name": face_record.ModelName,
                 "detector_backend": face_record.DetectorBackend,
                 "registration_source": face_record.RegistrationSource,
-                "registered_at": face_record.CreationDateTime.isoformat()
+                "registered_at": face_record.CreationDateTime.isoformat(),
+                "accessed_by": current_user.name
             }
         else:
             return {
                 "user_id": user_id,
                 "user_name": user.Name,
-                "registered": False
+                "registered": False,
+                "accessed_by": current_user.name
             }
             
     except HTTPException:
@@ -1229,22 +1270,24 @@ async def get_face_status(user_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error getting face status for user {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to get face status")
-
+    
 @app.get("/api/v1/face/verifications/{user_id}")
-async def get_verification_history(user_id: int, limit: int = 10, db: Session = Depends(get_db)):
-    """Get verification history for a user"""
+async def get_verification_history(
+    user_id: int, 
+    limit: int = 10, 
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(verify_user_access)
+):
+    """Get verification history for a user - PROTECTED"""
     try:
-        # Check if user exists
         user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Get verification history
         verifications = db.query(FaceVerification).filter(
             FaceVerification.UserID == user_id
         ).order_by(FaceVerification.VerificationDateTime.desc()).limit(limit).all()
         
-        # Format response
         verification_list = []
         for v in verifications:
             verification_list.append({
@@ -1265,20 +1308,186 @@ async def get_verification_history(user_id: int, limit: int = 10, db: Session = 
         return {
             "user_id": user_id,
             "total_verifications": len(verification_list),
-            "verifications": verification_list
+            "verifications": verification_list,
+            "accessed_by": current_user.name
         }
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting verification history for user {user_id}: {str(e)}")
-        # Return empty history instead of error for better UX
         return {
             "user_id": user_id,
             "total_verifications": 0,
-            "verifications": []
+            "verifications": [],
+            "accessed_by": current_user.name
         }
 
+@app.get("/api/v1/users")
+async def get_all_users(
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user)
+):
+    """Get all active users from database - PROTECTED"""
+    try:
+        # Only admins can see all users
+        if not current_user.is_admin():
+            raise PermissionError("Admin privileges required to view all users")
+        
+        users = db.query(AppUser).filter(AppUser.Active == True).order_by(AppUser.Name).all()
+        
+        user_list = []
+        for user in users:
+            role_map = {
+                1: "Student",
+                2: "Instructor", 
+                3: "Admin",
+                4: "Staff"
+            }
+            
+            user_list.append({
+                "id": user.id,
+                "name": user.Name,
+                "email": user.Email,
+                "mobile": user.MobileNumber,
+                "role": role_map.get(user.RoleID, "Student"),
+                "roleId": user.RoleID,
+                "status": user.Status,
+                "active": user.Active,
+                "salutation": user.Salutation,
+                "lastLogin": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
+                "createdAt": user.CreationDateTime.isoformat(),
+                "updatedAt": user.UpdationDateTime.isoformat()
+            })
+        
+        logger.info(f"Admin {current_user.name} retrieved {len(user_list)} active users from database")
+        return user_list
+        
+    except PermissionError:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting all users: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+@app.get("/api/v1/user/{user_id}")
+async def get_user_by_id(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(verify_user_access)
+):
+    """Get specific user by ID - PROTECTED"""
+    try:
+        user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        role_map = {
+            1: "Student",
+            2: "Instructor", 
+            3: "Admin",
+            4: "Staff"
+        }
+        
+        return {
+            "id": user.id,
+            "name": user.Name,
+            "email": user.Email,
+            "mobile": user.MobileNumber,
+            "role": role_map.get(user.RoleID, "Student"),
+            "roleId": user.RoleID,
+            "status": user.Status,
+            "active": user.Active,
+            "salutation": user.Salutation,
+            "lastLogin": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
+            "createdAt": user.CreationDateTime.isoformat(),
+            "updatedAt": user.UpdationDateTime.isoformat(),
+            "accessed_by": current_user.name
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch user")
+
+@app.get("/api/v1/users/stats")
+async def get_users_stats(
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_admin_user)
+):
+    """Get user statistics - ADMIN ONLY"""
+    try:
+        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
+        students = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 1).count()
+        instructors = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 2).count()
+        staff = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 4).count()
+        admins = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 3).count()
+        
+        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        
+        registration_rate = (registered_faces / total_users * 100) if total_users > 0 else 0
+        
+        return {
+            "total_users": total_users,
+            "students": students,
+            "instructors": instructors,
+            "staff": staff,
+            "admins": admins,
+            "registered_faces": registered_faces,
+            "registration_rate": registration_rate,
+            "accessed_by": current_user.name
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting user stats: {str(e)}")
+        return {
+            "total_users": 0,
+            "students": 0,
+            "instructors": 0,
+            "staff": 0,
+            "admins": 0,
+            "registered_faces": 0,
+            "registration_rate": 0,
+            "accessed_by": current_user.name
+        }
+
+@app.get("/api/v1/stats")
+async def get_system_stats(
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user)
+):
+    """Get system statistics - PROTECTED"""
+    try:
+        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
+        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        
+        registration_rate = (registered_faces / total_users * 100) if total_users > 0 else 0
+        
+        return {
+            "total_users": total_users,
+            "registered_faces": registered_faces,
+            "registration_rate": registration_rate,
+            "success_rate_24h": 95.0,
+            "system_health": "excellent" if registration_rate > 80 else "good",
+            "active_sessions": len(manager.active_connections),
+            "avg_processing_time": 1500,
+            "total_verifications_today": 0,
+            "accessed_by": current_user.name
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting system stats: {str(e)}")
+        return {
+            "total_users": 4,
+            "registered_faces": 0,
+            "registration_rate": 0,
+            "success_rate_24h": 0,
+            "system_health": "poor",
+            "active_sessions": len(manager.active_connections),
+            "avg_processing_time": 1500,
+            "total_verifications_today": 0,
+            "accessed_by": current_user.name
+        }
 
 @app.get("/api/v1/health")
 async def health_check(db: Session = Depends(get_db)):
@@ -1332,7 +1541,7 @@ async def health_check(db: Session = Depends(get_db)):
         "version": "3.0.0"
     }
 
-@app.get("/api/v1/stats")
+@app.get("/api/v1/stats/public")
 async def get_system_stats(db: Session = Depends(get_db)):
     """Get system statistics"""
     try:
@@ -1366,118 +1575,6 @@ async def get_system_stats(db: Session = Depends(get_db)):
             "total_verifications_today": 0
         }
     
-@app.get("/api/v1/users")
-async def get_all_users(db: Session = Depends(get_db)):
-    """Get all active users from database"""
-    try:
-        users = db.query(AppUser).filter(AppUser.Active == True).order_by(AppUser.Name).all()
-        
-        user_list = []
-        for user in users:
-            # Map RoleID to role names
-            role_map = {
-                1: "Student",
-                2: "Instructor", 
-                3: "Admin",
-                4: "Staff"
-            }
-            
-            user_list.append({
-                "id": user.id,
-                "name": user.Name,
-                "email": user.Email,
-                "mobile": user.MobileNumber,
-                "role": role_map.get(user.RoleID, "Student"),
-                "roleId": user.RoleID,
-                "status": user.Status,
-                "active": user.Active,
-                "salutation": user.Salutation,
-                "lastLogin": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
-                "createdAt": user.CreationDateTime.isoformat(),
-                "updatedAt": user.UpdationDateTime.isoformat()
-            })
-        
-        logger.info(f"Retrieved {len(user_list)} active users from database")
-        return user_list
-        
-    except Exception as e:
-        logger.error(f"Error getting all users: {str(e)}")
-        # Return empty list instead of demo users
-        raise HTTPException(status_code=500, detail="Failed to fetch users")
-
-@app.get("/api/v1/user/{user_id}")
-async def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
-    """Get specific user by ID"""
-    try:
-        user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Map RoleID to role names
-        role_map = {
-            1: "Student",
-            2: "Instructor", 
-            3: "Admin",
-            4: "Staff"
-        }
-        
-        return {
-            "id": user.id,
-            "name": user.Name,
-            "email": user.Email,
-            "mobile": user.MobileNumber,
-            "role": role_map.get(user.RoleID, "Student"),
-            "roleId": user.RoleID,
-            "status": user.Status,
-            "active": user.Active,
-            "salutation": user.Salutation,
-            "lastLogin": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
-            "createdAt": user.CreationDateTime.isoformat(),
-            "updatedAt": user.UpdationDateTime.isoformat()
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting user {user_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to fetch user")
-
-@app.get("/api/v1/users/stats")
-async def get_users_stats(db: Session = Depends(get_db)):
-    """Get user statistics"""
-    try:
-        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
-        students = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 1).count()
-        instructors = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 2).count()
-        staff = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 4).count()
-        admins = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 3).count()
-        
-        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
-        
-        # Calculate registration rate
-        registration_rate = (registered_faces / total_users * 100) if total_users > 0 else 0
-        
-        return {
-            "total_users": total_users,
-            "students": students,
-            "instructors": instructors,
-            "staff": staff,
-            "admins": admins,
-            "registered_faces": registered_faces,
-            "registration_rate": registration_rate
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting user stats: {str(e)}")
-        return {
-            "total_users": 0,
-            "students": 0,
-            "instructors": 0,
-            "staff": 0,
-            "admins": 0,
-            "registered_faces": 0,
-            "registration_rate": 0
-        }
 
 if __name__ == "__main__":
     import uvicorn
