@@ -1279,38 +1279,6 @@ async def get_verification_history(user_id: int, limit: int = 10, db: Session = 
             "verifications": []
         }
 
-@app.get("/api/v1/users")
-async def get_all_users(db: Session = Depends(get_db)):
-    """Get all active users"""
-    try:
-        users = db.query(AppUser).filter(AppUser.Active == True).all()
-        
-        user_list = []
-        for user in users:
-            user_list.append({
-                "id": user.id,
-                "Name": user.Name,
-                "Email": user.Email,
-                "MobileNumber": user.MobileNumber,
-                "Status": user.Status,
-                "RoleID": user.RoleID,
-                "Active": user.Active,
-                "LastLoginDateTime": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
-                "CreationDateTime": user.CreationDateTime.isoformat(),
-                "UpdationDateTime": user.UpdationDateTime.isoformat()
-            })
-        
-        return user_list
-        
-    except Exception as e:
-        logger.error(f"Error getting all users: {str(e)}")
-        # Return demo users for better UX
-        return [
-            {"id": 1, "Name": "John Doe", "Email": "john@example.com", "Status": "ACTIVE", "RoleID": 1, "Active": True},
-            {"id": 2, "Name": "Jane Smith", "Email": "jane@example.com", "Status": "ACTIVE", "RoleID": 1, "Active": True},
-            {"id": 3, "Name": "Bob Johnson", "Email": "bob@example.com", "Status": "ACTIVE", "RoleID": 2, "Active": True},
-            {"id": 4, "Name": "Alice Wilson", "Email": "alice@example.com", "Status": "ACTIVE", "RoleID": 1, "Active": True}
-        ]
 
 @app.get("/api/v1/health")
 async def health_check(db: Session = Depends(get_db)):
@@ -1396,6 +1364,119 @@ async def get_system_stats(db: Session = Depends(get_db)):
             "active_sessions": len(manager.active_connections),
             "avg_processing_time": 1500,
             "total_verifications_today": 0
+        }
+    
+@app.get("/api/v1/users")
+async def get_all_users(db: Session = Depends(get_db)):
+    """Get all active users from database"""
+    try:
+        users = db.query(AppUser).filter(AppUser.Active == True).order_by(AppUser.Name).all()
+        
+        user_list = []
+        for user in users:
+            # Map RoleID to role names
+            role_map = {
+                1: "Student",
+                2: "Instructor", 
+                3: "Admin",
+                4: "Staff"
+            }
+            
+            user_list.append({
+                "id": user.id,
+                "name": user.Name,
+                "email": user.Email,
+                "mobile": user.MobileNumber,
+                "role": role_map.get(user.RoleID, "Student"),
+                "roleId": user.RoleID,
+                "status": user.Status,
+                "active": user.Active,
+                "salutation": user.Salutation,
+                "lastLogin": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
+                "createdAt": user.CreationDateTime.isoformat(),
+                "updatedAt": user.UpdationDateTime.isoformat()
+            })
+        
+        logger.info(f"Retrieved {len(user_list)} active users from database")
+        return user_list
+        
+    except Exception as e:
+        logger.error(f"Error getting all users: {str(e)}")
+        # Return empty list instead of demo users
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+@app.get("/api/v1/user/{user_id}")
+async def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
+    """Get specific user by ID"""
+    try:
+        user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.Active == True).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Map RoleID to role names
+        role_map = {
+            1: "Student",
+            2: "Instructor", 
+            3: "Admin",
+            4: "Staff"
+        }
+        
+        return {
+            "id": user.id,
+            "name": user.Name,
+            "email": user.Email,
+            "mobile": user.MobileNumber,
+            "role": role_map.get(user.RoleID, "Student"),
+            "roleId": user.RoleID,
+            "status": user.Status,
+            "active": user.Active,
+            "salutation": user.Salutation,
+            "lastLogin": user.LastLoginDateTime.isoformat() if user.LastLoginDateTime else None,
+            "createdAt": user.CreationDateTime.isoformat(),
+            "updatedAt": user.UpdationDateTime.isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch user")
+
+@app.get("/api/v1/users/stats")
+async def get_users_stats(db: Session = Depends(get_db)):
+    """Get user statistics"""
+    try:
+        total_users = db.query(AppUser).filter(AppUser.Active == True).count()
+        students = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 1).count()
+        instructors = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 2).count()
+        staff = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 4).count()
+        admins = db.query(AppUser).filter(AppUser.Active == True, AppUser.RoleID == 3).count()
+        
+        registered_faces = db.query(Face).filter(Face.IsActive == True).count()
+        
+        # Calculate registration rate
+        registration_rate = (registered_faces / total_users * 100) if total_users > 0 else 0
+        
+        return {
+            "total_users": total_users,
+            "students": students,
+            "instructors": instructors,
+            "staff": staff,
+            "admins": admins,
+            "registered_faces": registered_faces,
+            "registration_rate": registration_rate
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting user stats: {str(e)}")
+        return {
+            "total_users": 0,
+            "students": 0,
+            "instructors": 0,
+            "staff": 0,
+            "admins": 0,
+            "registered_faces": 0,
+            "registration_rate": 0
         }
 
 if __name__ == "__main__":
