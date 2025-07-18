@@ -68,9 +68,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Utility Functions
-def decode_base64_frame(frame_data: str) -> np.ndarray:
+def decode_base64_frame(frame_data: str) -> Optional[np.ndarray]:
     """Decode base64 frame data to numpy array for face processing"""
     try:
+        if not frame_data:
+            logger.error("Empty frame data received")
+            return None
+            
         # Remove data URL prefix if present
         if frame_data.startswith('data:image'):
             frame_data = frame_data.split(',', 1)[1]
@@ -85,9 +89,15 @@ def decode_base64_frame(frame_data: str) -> np.ndarray:
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Convert to numpy array
+        # Convert to numpy array (ensure correct format)
         image_array = np.array(image)
         
+        # Validate image array
+        if image_array.size == 0:
+            logger.error("Empty image array after conversion")
+            return None
+            
+        logger.debug(f"Successfully decoded frame: {image_array.shape}")
         return image_array
         
     except Exception as e:
@@ -97,6 +107,9 @@ def decode_base64_frame(frame_data: str) -> np.ndarray:
 def encrypt_face_encoding(encoding: np.ndarray) -> bytes:
     """Encrypt face encoding using Fernet encryption"""
     try:
+        if encoding is None or encoding.size == 0:
+            raise ValueError("Invalid encoding provided")
+            
         # Convert numpy array to bytes
         encoding_bytes = pickle.dumps(encoding)
         
@@ -112,6 +125,9 @@ def encrypt_face_encoding(encoding: np.ndarray) -> bytes:
 def decrypt_face_encoding(encrypted_data: bytes) -> np.ndarray:
     """Decrypt face encoding from encrypted bytes"""
     try:
+        if not encrypted_data:
+            raise ValueError("No encrypted data provided")
+            
         # Decrypt using Fernet
         decrypted_bytes = cipher_suite.decrypt(encrypted_data)
         
@@ -127,7 +143,7 @@ def decrypt_face_encoding(encrypted_data: bytes) -> np.ndarray:
 def validate_frame_data(frame_data: str) -> bool:
     """Validate that frame data is proper base64 encoded image"""
     try:
-        if not frame_data:
+        if not frame_data or not isinstance(frame_data, str):
             return False
             
         # Remove data URL prefix if present
@@ -139,10 +155,11 @@ def validate_frame_data(frame_data: str) -> bool:
         
         return True
         
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Frame validation failed: {str(e)}")
         return False
 
-# Database Models
+
 class AppUser(Base):
     __tablename__ = "AppUser"
     
@@ -221,7 +238,6 @@ def get_db():
     finally:
         db.close()
 
-# Enhanced Face Recognition Service
 class OptimizedFaceRecognitionService:
     def __init__(self):
         self.model_name = "ArcFace"
@@ -245,9 +261,17 @@ class OptimizedFaceRecognitionService:
         
         logger.info(f"✅ Optimized FaceRecognitionService initialized")
 
-    async def extract_face_async(self, image_array, timeout: float = 15.0) -> Dict[str, Any]:
+    async def extract_face_async(self, image_array: np.ndarray, timeout: float = 15.0) -> Dict[str, Any]:
         """Async wrapper for face extraction with timeout"""
         try:
+            if image_array is None or image_array.size == 0:
+                return {
+                    "success": False,
+                    "error": "Invalid image data provided",
+                    "spoofing_detected": False,
+                    "processing_time": 0
+                }
+                
             loop = asyncio.get_event_loop()
             
             # Run in thread pool with timeout
@@ -279,10 +303,18 @@ class OptimizedFaceRecognitionService:
                 "processing_time": 0
             }
 
-    def _extract_face_sync(self, image_array) -> Dict[str, Any]:
+    def _extract_face_sync(self, image_array: np.ndarray) -> Dict[str, Any]:
         """Synchronous face extraction - runs in thread pool"""
         try:
             start_time = time.time()
+            
+            if image_array is None or image_array.size == 0:
+                return {
+                    "success": False,
+                    "error": "Invalid image array",
+                    "spoofing_detected": False,
+                    "processing_time": 0
+                }
             
             # Simplified face extraction for speed
             faces = DeepFace.extract_faces(
@@ -296,7 +328,7 @@ class OptimizedFaceRecognitionService:
             if not faces:
                 return {
                     "success": False,
-                    "error": "No face detected",
+                    "error": "No face detected in frame",
                     "spoofing_detected": False,
                     "processing_time": (time.time() - start_time) * 1000
                 }
@@ -308,7 +340,7 @@ class OptimizedFaceRecognitionService:
             if not face.get('is_real', True):
                 return {
                     "success": False,
-                    "error": "Please use your real face",
+                    "error": "Please use your real face - spoofing detected",
                     "spoofing_detected": True,
                     "antispoofing_score": face.get('antispoof_score', 0.0),
                     "processing_time": (time.time() - start_time) * 1000
@@ -353,11 +385,13 @@ class OptimizedFaceRecognitionService:
             }
             
         except Exception as e:
+            processing_time = (time.time() - start_time) * 1000 if 'start_time' in locals() else 0
+            logger.error(f"Face extraction sync error: {str(e)}")
             return {
                 "success": False,
-                "error": f"Processing error: {str(e)}",
+                "error": f"Face processing failed: {str(e)}",
                 "spoofing_detected": False,
-                "processing_time": (time.time() - start_time) * 1000
+                "processing_time": processing_time
             }
 
     def _quick_quality_score(self, image: np.ndarray, facial_area: dict, face_confidence: float) -> float:
@@ -378,13 +412,24 @@ class OptimizedFaceRecognitionService:
             
             return max(0, min(100, quality_score))
             
-        except Exception:
+        except Exception as e:
+            logger.error(f"Quality score calculation error: {str(e)}")
             return 50.0  # Default score
     
     def compare_faces_with_verification(self, registered_encoding: np.ndarray, current_encoding: np.ndarray) -> Dict[str, Any]:
         """Enhanced face comparison with multiple similarity metrics for better verification"""
         try:
             start_time = time.time()
+            
+            # Validate inputs
+            if registered_encoding is None or current_encoding is None:
+                return {
+                    "similarity_score": 0.0,
+                    "is_match": False,
+                    "confidence": 0.0,
+                    "error": "Invalid encoding data",
+                    "processing_time": 0
+                }
             
             # Calculate multiple similarity metrics
             # 1. Cosine similarity (primary)
@@ -443,7 +488,6 @@ class OptimizedFaceRecognitionService:
                 "processing_time": 0
             }
 
-# Connection Manager
 class OptimizedConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Dict] = {}
@@ -605,7 +649,6 @@ class OptimizedConnectionManager:
 manager = OptimizedConnectionManager()
 face_service = OptimizedFaceRecognitionService()
 
-# WebSocket Endpoints
 @app.websocket("/ws/face-registration/{user_id}")
 async def optimized_face_registration_stream(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
     """Optimized real-time face registration with proper timeout handling"""
@@ -653,7 +696,7 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                         connection["processing"] = True
                     
                     try:
-                        frame_data = message_data["frame"]
+                        frame_data = message_data.get("frame", "")
                         connection["frame_count"] += 1
                         
                         # Skip frames for performance (process every Nth frame)
@@ -668,7 +711,7 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                             })
                             continue
                         
-                        # Decode frame
+                        # Decode frame using the fixed function
                         frame = decode_base64_frame(frame_data)
                         if frame is None:
                             await manager.send_message(session_id, {
@@ -680,7 +723,7 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                         # Process frame asynchronously with timeout
                         process_start = time.time()
                         result = await face_service.extract_face_async(frame, timeout=10.0)
-                        process_time = time.time() - process_start
+                        process_time = (time.time() - process_start) * 1000
                         
                         frame_processing_times.append(process_time)
                         connection["processed_count"] += 1
@@ -798,7 +841,7 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                                         "message": "Face registration completed successfully!"
                                     })
                                     
-                                    logger.info(f"✅ Face registered for user {user_id} in {avg_processing_time:.2f}s avg")
+                                    logger.info(f"✅ Face registered for user {user_id} in {avg_processing_time:.2f}ms avg")
                                     break
                                     
                             except asyncio.TimeoutError:
@@ -824,7 +867,10 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
                 elif message_data.get("type") == "stop":
                     break
                 elif message_data.get("type") == "ping":
-                    await manager.send_message(session_id, {"type": "pong"})
+                    await manager.send_message(session_id, {
+                        "type": "pong",
+                        "timestamp": message_data.get("timestamp")
+                    })
                     
             except asyncio.TimeoutError:
                 logger.warning(f"WebSocket receive timeout for {session_id}")
@@ -863,6 +909,7 @@ async def optimized_face_registration_stream(websocket: WebSocket, user_id: int,
             pass
     finally:
         await manager.disconnect(session_id)
+
 
 @app.websocket("/ws/face-verification/{user_id}")
 async def optimized_face_verification_stream(
