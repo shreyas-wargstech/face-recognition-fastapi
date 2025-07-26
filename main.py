@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, D
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.sql import func
+from verify_token_api import verify_jwt_token
 
 # DeepFace imports
 from deepface import DeepFace
@@ -45,8 +46,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://localhost:3001",
-        "https://your-domain.com",
+        "http://localhost:3001",,
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -54,7 +54,7 @@ app.add_middleware(
 )
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "mysql://root:password@localhost/lms_face_recognition")
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql://root:password@localhost/lms")
 engine = create_engine(DATABASE_URL, echo=True, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -653,6 +653,16 @@ face_service = OptimizedFaceRecognitionService()
 async def optimized_face_registration_stream(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
     """Optimized real-time face registration with proper timeout handling"""
     session_id = f"reg_{user_id}_{uuid.uuid4().hex[:8]}"
+
+    auth_token = websocket.headers.get("Authorization")
+    if not auth_token:
+        await websocket.close(code=4000, reason="Authorization header missing")
+        return
+    auth_token = auth_token.split("Bearer ")[-1].strip()
+    user_auth_dto = await verify_jwt_token(auth_token)
+    if not user_auth_dto or user_auth_dto.id != user_id:
+        await websocket.close(code=4001, reason="Invalid or expired token")
+        return
     
     try:
         # Check if user exists
@@ -921,6 +931,16 @@ async def optimized_face_verification_stream(
 ):
     """Optimized real-time face verification with proper timeout handling"""
     session_id = f"ver_{user_id}_{uuid.uuid4().hex[:8]}"
+    
+    auth_token = websocket.headers.get("Authorization")
+    if not auth_token:
+        await websocket.close(code=4000, reason="Authorization header missing")
+        return
+    auth_token = auth_token.split("Bearer ")[-1].strip()
+    user_auth_dto = await verify_jwt_token(auth_token)
+    if not user_auth_dto or user_auth_dto.id != user_id:
+        await websocket.close(code=4001, reason="Invalid or expired token")
+        return
     
     try:
         # Check if user exists
